@@ -33,3 +33,17 @@
     border-radius: 2px;
     transition: width 0.3s ease;
 }
+
+#export-cards-dropzone:hover {
+    border-color: var(--SmartThemeQuoteColor);
+    background: rgba(92, 184, 92, 0.05);
+}
+
+#export-tags-filter label {
+    cursor: pointer;
+    user-select: none;
+}
+
+#export-tags-filter label:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
