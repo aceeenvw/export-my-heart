@@ -1,0 +1,12 @@
+{
+    "display_name": "Export My Heart",
+    "loading_order": 1,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "aceenvw",
+    "version": "3.0.0",
+    "homePage": "",
+    "auto_update": true
+}
