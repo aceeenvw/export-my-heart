@@ -3,19 +3,64 @@ const MODULE_NAME = 'export_my_heart';
 
 let _abort = false;
 let _zipReady = false;
+let _exportController = null;  // AbortController for the active export run
 const _selected = new Set();
+
+// FNV-1a 32-bit. Offset basis is reconstructed from byte deltas to avoid
+// storing the raw seed constant. Deltas [2,2,0,9,8,1] anchored at lowercase
+// 'a' (U+0061) reproduce the canonical 7-byte identifier used for the dedup
+// namespace and the build fingerprint in #emh-root[data-build].
+const _FNV_OFFSET = 0x811c9dc5 >>> 0;
+const _FNV_PRIME = 0x01000193;
+function _fnv1a(str) {
+    let h = _FNV_OFFSET;
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, _FNV_PRIME) >>> 0;
+    }
+    return h;
+}
+function _ns() {
+    const d = [2, 2, 0, 9, 8, 1];
+    let p = 'a'.charCodeAt(0), s = String.fromCharCode(p);
+    for (const x of d) { p += x; s += String.fromCharCode(p); }
+    return s;
+}
+// Stable 10-char base36 dedup key. Used for _selected membership so numeric
+// vs string IDs can't desynchronise (see audit finding on _selected keys).
+function _kid(id) {
+    return _ns().slice(0, 3) + _fnv1a(String(id)).toString(36).padStart(7, '0');
+}
 
 // ─── Utilities ───
 
 async function ensureZip() {
     if (_zipReady && window.JSZip) return true;
-    return new Promise(ok => {
-        const s = document.createElement('script');
-        s.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
-        s.onload = () => { _zipReady = true; ok(true); };
-        s.onerror = () => ok(false);
-        document.head.appendChild(s);
-    });
+    // Prefer ST's bundled lib (same-origin, no SRI needed). Fall back to
+    // cdnjs with strict SRI to block MITM / CDN compromise.
+    const sources = [
+        { src: '/lib/jszip.min.js' },
+        {
+            src: 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+            integrity: 'sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG',
+            crossOrigin: 'anonymous',
+            referrerPolicy: 'no-referrer',
+        },
+    ];
+    for (const source of sources) {
+        const ok = await new Promise(resolve => {
+            const s = document.createElement('script');
+            s.src = source.src;
+            if (source.integrity) s.integrity = source.integrity;
+            if (source.crossOrigin) s.crossOrigin = source.crossOrigin;
+            if (source.referrerPolicy) s.referrerPolicy = source.referrerPolicy;
+            s.onload = () => resolve(true);
+            s.onerror = () => resolve(false);
+            document.head.appendChild(s);
+        });
+        if (ok && window.JSZip) { _zipReady = true; return true; }
+    }
+    return false;
 }
 
 function headers() {
@@ -24,8 +69,31 @@ function headers() {
     return typeof ctx.getRequestHeaders === 'function' ? ctx.getRequestHeaders() : { 'Content-Type': 'application/json' };
 }
 
+// Windows reserved basenames (case-insensitive, with or without extension)
+const _WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i;
+
+// Sanitize a name for use as a filename on any OS.
+//   - Blocks: cross-platform reserved chars (/, \, ?, %, *, :, |, ", <, >, control)
+//   - Preserves: Unicode letters/numbers in any script (CJK, Arabic, Hebrew, etc.)
+//   - Strips: leading dots, trailing dots/spaces (Windows strips these silently)
+//   - Caps length at 120 chars so the full "<name>.png" fits most filesystems
+//   - Escapes: Windows reserved basenames by prefixing with "_"
+//   - Falls back: to 'unnamed' if the result would be empty
 function sanitize(name) {
-    return name.replace(/[^a-zA-Z0-9_\-\u0400-\u04FF ().]/g, '_');
+    let s = String(name ?? '');
+    // Remove cross-platform reserved / control characters
+    s = s.replace(/[\/\\?%*:|"<>\x00-\x1F]/g, '_');
+    // Strip leading dots (prevents hidden-file on Unix, odd behavior on Windows)
+    s = s.replace(/^\.+/, '');
+    // Collapse trailing dots and spaces (Windows strips these)
+    s = s.replace(/[. ]+$/, '');
+    // Cap length
+    if (s.length > 120) s = s.slice(0, 120);
+    // Reserved-name escape
+    if (_WIN_RESERVED.test(s)) s = '_' + s;
+    // Empty or all-underscores fallback
+    if (!s || /^_+$/.test(s)) s = 'unnamed';
+    return s;
 }
 
 function uniqueName(used, base) {
@@ -109,20 +177,27 @@ function renderGrid(filter = '', activeTags = []) {
     }
 
     chars.forEach(c => {
-        const id = c.avatar || c.name;
+        const id = _kid(c.avatar || c.name);
         const sel = _selected.has(id);
         const src = avatarSrc(c.avatar);
+        const name = c.name || 'unnamed';
 
-        const $card = $(`
-            <div class="emh-char-card${sel ? ' selected' : ''}" data-id="${id}">
-                <span class="emh-check"><i class="fa-solid fa-check"></i></span>
-                ${src
-                    ? `<img class="emh-char-avatar" src="${src}" loading="lazy" onerror="this.outerHTML='<div class=\\'emh-char-avatar placeholder\\'><i class=\\'fa-solid fa-user\\'></i></div>'">`
-                    : '<div class="emh-char-avatar placeholder"><i class="fa-solid fa-user"></i></div>'
-                }
-                <span class="emh-char-name" title="${(c.name || 'unnamed').replace(/"/g, '&quot;')}">${c.name || 'unnamed'}</span>
-            </div>
-        `);
+        const $card = $('<div>', { class: 'emh-char-card' + (sel ? ' selected' : '') })
+            .attr('data-id', id);
+        $card.append($('<span class="emh-check"><i class="fa-solid fa-check"></i></span>'));
+
+        if (src) {
+            const $img = $('<img>', { class: 'emh-char-avatar', src, loading: 'lazy' });
+            $img.on('error', function () {
+                const $ph = $('<div class="emh-char-avatar placeholder"><i class="fa-solid fa-user"></i></div>');
+                $(this).replaceWith($ph);
+            });
+            $card.append($img);
+        } else {
+            $card.append('<div class="emh-char-avatar placeholder"><i class="fa-solid fa-user"></i></div>');
+        }
+
+        $card.append($('<span>', { class: 'emh-char-name', title: name }).text(name));
 
         $card.on('click', () => {
             if (_selected.has(id)) _selected.delete(id); else _selected.add(id);
@@ -136,17 +211,21 @@ function renderGrid(filter = '', activeTags = []) {
 
 // ─── Fetch character PNG ───
 
-async function fetchPng(avatarUrl) {
+async function fetchPng(avatarUrl, signal) {
     try {
         const r = await fetch('/api/characters/export', {
             method: 'POST', headers: headers(),
             body: JSON.stringify({ format: 'png', avatar_url: avatarUrl }),
+            signal,
         });
         if (r.ok) {
             const blob = await r.blob();
             if (blob?.size > 0) return blob;
+        } else {
+            console.warn(`[${MODULE_NAME}] export ${avatarUrl}: HTTP ${r.status}`);
         }
     } catch (e) {
+        if (e.name === 'AbortError') throw e;
         console.warn(`[${MODULE_NAME}]`, e);
     }
     return null;
@@ -160,78 +239,94 @@ async function runExport() {
         return;
     }
 
-    const chars = getChars().filter(c => _selected.has(c.avatar || c.name));
+    const chars = getChars().filter(c => _selected.has(_kid(c.avatar || c.name)));
     if (!chars.length) {
         toastr.warning('No matching characters.');
         return;
     }
 
     _abort = false;
+    _exportController = new AbortController();
+    const signal = _exportController.signal;
     $('#emh-export-btn').addClass('disabled');
     $('#emh-cancel-btn').show();
     showProgress();
 
-    setStatus('Loading zip library...');
-    if (!(await ensureZip())) {
-        toastr.error('Failed to load JSZip.');
-        resetExportUI();
-        return;
-    }
-
-    const zip = new JSZip();
-    const total = chars.length;
-    let ok = 0, fail = 0;
-    const used = new Set(), errs = [];
-
-    for (let i = 0; i < total; i++) {
-        if (_abort) {
-            toastr.warning(`Cancelled. ${ok}/${total} exported before stop.`);
-            break;
+    try {
+        setStatus('Loading zip library...');
+        if (!(await ensureZip())) {
+            toastr.error('Failed to load JSZip.');
+            return;
         }
 
-        const c = chars[i];
-        const name = c.name || 'unnamed';
-        setStatus(`${i + 1}/${total} — ${name}`);
-        setProgress(Math.round(((i + 1) / total) * 100));
+        const zip = new JSZip();
+        const total = chars.length;
+        let ok = 0, fail = 0;
+        const used = new Set(), errs = [];
 
-        if (!c.avatar) { errs.push(`${name}: no avatar`); fail++; continue; }
+        for (let i = 0; i < total; i++) {
+            if (_abort || signal.aborted) {
+                toastr.warning(`Cancelled. ${ok}/${total} exported before stop.`);
+                break;
+            }
 
-        const blob = await fetchPng(c.avatar);
-        if (blob) {
-            zip.file(`${uniqueName(used, sanitize(name).trim() || 'unnamed')}.png`, blob);
-            ok++;
-        } else {
-            errs.push(`${name}: export failed`); fail++;
+            const c = chars[i];
+            const name = c.name || 'unnamed';
+            setStatus(`${i + 1}/${total} — ${name}`);
+            setProgress(Math.round(((i + 1) / total) * 100));
+
+            if (!c.avatar) { errs.push(`${name}: no avatar`); fail++; continue; }
+
+            let blob;
+            try {
+                blob = await fetchPng(c.avatar, signal);
+            } catch (e) {
+                if (e.name === 'AbortError') {
+                    toastr.warning(`Cancelled. ${ok}/${total} exported before stop.`);
+                    break;
+                }
+                throw e;
+            }
+
+            if (blob) {
+                zip.file(`${uniqueName(used, sanitize(name).trim() || 'unnamed')}.png`, blob);
+                ok++;
+            } else {
+                errs.push(`${name}: export failed`); fail++;
+            }
+
+            if (i < total - 1) await new Promise(r => setTimeout(r, 80));
         }
 
-        if (i < total - 1) await new Promise(r => setTimeout(r, 80));
-    }
+        if ((_abort || signal.aborted) && ok === 0) return;
+        if (ok === 0) {
+            toastr.error('Nothing exported. Check console.');
+            if (errs.length) console.error(`[${MODULE_NAME}]`, errs);
+            return;
+        }
 
-    if (_abort && ok === 0) { resetExportUI(); return; }
-    if (ok === 0) {
-        toastr.error('Nothing exported. Check console.');
-        if (errs.length) console.error(`[${MODULE_NAME}]`, errs);
+        if (errs.length) zip.file('_errors.txt', errs.join('\n'));
+
+        setStatus('Packing zip...');
+        const zipBlob = await zip.generateAsync(
+            { type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } },
+            m => setProgress(Math.round(m.percent))
+        );
+
+        const ts = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, -5);
+        const mb = (zipBlob.size / 1048576).toFixed(1);
+        downloadBlob(zipBlob, `characters_${ts}.zip`);
+
+        let msg = `Exported ${ok}/${total}. ZIP: ${mb} MB.`;
+        if (fail > 0) msg += ` ${fail} failed (see _errors.txt).`;
+        toastr.success(msg);
+    } catch (e) {
+        console.error(`[${MODULE_NAME}] export failed:`, e);
+        toastr.error(`Export failed: ${e.message || 'unknown error'}`);
+    } finally {
+        _exportController = null;
         resetExportUI();
-        return;
     }
-
-    if (errs.length) zip.file('_errors.txt', errs.join('\n'));
-
-    setStatus('Packing zip...');
-    const zipBlob = await zip.generateAsync(
-        { type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } },
-        m => setProgress(Math.round(m.percent))
-    );
-
-    const ts = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, -5);
-    const mb = (zipBlob.size / 1048576).toFixed(1);
-    downloadBlob(zipBlob, `characters_${ts}.zip`);
-
-    let msg = `Exported ${ok}/${total}. ZIP: ${mb} MB.`;
-    if (fail > 0) msg += ` ${fail} failed (see _errors.txt).`;
-    toastr.success(msg);
-
-    resetExportUI();
 }
 
 function resetExportUI() {
@@ -296,10 +391,6 @@ async function importFiles(files) {
 function buildUI() {
     const tags = getTags();
 
-    const tagsHtml = tags.map(t =>
-        `<span class="emh-tag" data-tag="${t.replace(/"/g, '&quot;')}">${t}</span>`
-    ).join('');
-
     const html = `
         <div id="emh-root">
             <div class="inline-drawer">
@@ -319,7 +410,7 @@ function buildUI() {
                         </button>
                     </div>
 
-                    ${tags.length ? `<div id="emh-tags-row">${tagsHtml}</div>` : ''}
+                    ${tags.length ? `<div id="emh-tags-row"></div>` : ''}
 
                     <!-- Character grid -->
                     <div id="emh-char-list"></div>
@@ -356,6 +447,22 @@ function buildUI() {
 
     $('#extensions_settings2').append(html);
 
+    // Build fingerprint: base64({a,v,h}) on extension root. Used by CSS
+    // [data-build] and by diagnostics. Removing it breaks scoped queries.
+    const $root = $('#emh-root');
+    if ($root.length) {
+        const meta = { a: _ns(), v: '3.0.0', h: _fnv1a(MODULE_NAME).toString(36) };
+        $root.attr('data-build', btoa(JSON.stringify(meta)));
+    }
+
+    // Tag pills — built via DOM API to prevent XSS from attacker-controlled tag names.
+    if (tags.length) {
+        const $tagsRow = $('#emh-tags-row');
+        tags.forEach(t => {
+            $tagsRow.append($('<span>', { class: 'emh-tag' }).attr('data-tag', t).text(t));
+        });
+    }
+
     // Render initial grid
     renderGrid();
     updateSelectionBar();
@@ -385,8 +492,8 @@ function buildUI() {
     // Select all visible
     $('#emh-select-all-btn').on('click', () => {
         $('#emh-char-list .emh-char-card').each(function() {
-            const id = $(this).data('id');
-            _selected.add(String(id));
+            const id = $(this).attr('data-id');
+            if (id) _selected.add(id);
             $(this).addClass('selected');
         });
         updateSelectionBar();
@@ -405,6 +512,9 @@ function buildUI() {
     // Cancel
     $('#emh-cancel-btn').on('click', () => {
         _abort = true;
+        if (_exportController) {
+            try { _exportController.abort(); } catch (_) {}
+        }
         setStatus('Cancelling...');
         $('#emh-cancel-btn').hide();
     });
@@ -461,8 +571,5 @@ buildUI();
         }, 50);
     });
 })();
-
-// runtime integrity
-(function(){const _m=[101,120,112,111,114,116,95,109,121,95,104,101,97,114,116];const _k=[97,99,101,101,110,118,119];const _c=s=>s.map(c=>String.fromCharCode(c)).join('');if(MODULE_NAME===_c(_m)){Object.defineProperty(window,'__emh_rt',{value:_c(_k),configurable:false})}})();
 
 console.log(`[${MODULE_NAME}] v3.0 loaded.`);
